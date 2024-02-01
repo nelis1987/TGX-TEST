@@ -5129,4 +5129,5 @@
   <string name="EmulatorWarningReport">**Note**: you will need **GitHub account** to report this issue.\n\nAlternatively you can copy the link and send it to tgx-android@pm.me</string>
   <string name="EmulatorWarningReportBtn">Report on GitHub</string>
 
+  <string name="AreYouSureClearCalls">Do you want to delete all recent calls?</string>
 </resources>
