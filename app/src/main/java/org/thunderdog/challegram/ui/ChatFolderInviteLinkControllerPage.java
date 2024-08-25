@@ -25,7 +25,6 @@ import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
-import androidx.annotation.StringRes;
 import androidx.core.content.res.ResourcesCompat;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
@@ -136,6 +135,7 @@ public class ChatFolderInviteLinkControllerPage extends BottomSheetViewControlle
     updateActionButton();
 
     SeparatorView bottomShadowView = SeparatorView.simpleSeparator(context, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, 1f, Gravity.BOTTOM), false);
+    addThemeInvalidateListener(bottomShadowView);
     bottomShadowView.setAlignBottom();
     wrap.addView(bottomShadowView);
 
@@ -451,21 +451,13 @@ public class ChatFolderInviteLinkControllerPage extends BottomSheetViewControlle
     if (chatFolderId == NO_CHAT_FOLDER_ID) {
       if (!tdlib.canAddShareableFolder()) {
         UI.forceVibrateError(actionButton);
-        if (tdlib.hasPremium()) {
-          showTooltip(actionButton, R.string.ShareableFoldersLimitReached, tdlib.addedShareableChatFolderCountMax());
-        } else {
-          tdlib.ui().showPremiumLimitInfo(this, actionButton, TdlibUi.PremiumLimit.SHAREABLE_FOLDER_COUNT);
-        }
+        tdlib.ui().showLimitReachedInfo(this, actionButton, TdlibUi.PremiumLimit.SHAREABLE_FOLDER_COUNT);
         return;
       }
 
       if (!tdlib.canCreateChatFolder()) {
         UI.forceVibrateError(actionButton);
-        if (tdlib.hasPremium()) {
-          showTooltip(actionButton, R.string.ChatFolderLimitReached, tdlib.chatFolderCountMax());
-        } else {
-          tdlib.ui().showPremiumLimitInfo(this, actionButton, TdlibUi.PremiumLimit.CHAT_FOLDER_COUNT);
-        }
+        tdlib.ui().showLimitReachedInfo(this, actionButton, TdlibUi.PremiumLimit.CHAT_FOLDER_COUNT);
         return;
       }
     }
@@ -492,23 +484,10 @@ public class ChatFolderInviteLinkControllerPage extends BottomSheetViewControlle
       throw new IllegalStateException("mode = " + mode);
     }
     long[] leaveChatIds = selectedChatIds.toArray();
-    tdlib.send(new TdApi.DeleteChatFolder(chatFolderId, leaveChatIds), tdlib.typedOkHandler(() -> {
+    tdlib.deleteChatFolder(chatFolderId, leaveChatIds, () -> {
       UI.showToast(R.string.Done, Toast.LENGTH_SHORT);
-    }));
+    });
     parent.hidePopupWindow(true);
-  }
-
-  private void showTooltip (View view, @StringRes int markdownStringRes, Object... formatArgs) {
-    showTooltip(view, Lang.getMarkdownString(this, markdownStringRes, formatArgs));
-  }
-
-  private void showTooltip (View view, CharSequence text) {
-    context()
-      .tooltipManager()
-      .builder(view)
-      .controller(this)
-      .show(tdlib, text)
-      .hideDelayed();
   }
 
   private class Adapter extends SettingsAdapter {

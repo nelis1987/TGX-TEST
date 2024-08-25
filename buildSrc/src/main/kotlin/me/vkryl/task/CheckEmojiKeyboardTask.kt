@@ -36,6 +36,51 @@ open class CheckEmojiKeyboardTask : BaseTask() {
     return "\"${hex(text)}\" /* $text */"
   }
 
+  private fun javaWrapCodePoints(text: String): String {
+    return "intArrayOf(${text.codePoints().toArray().joinToString(", ") { "0x${it.toString(16)}" }})"
+  }
+
+  private fun ktCheckIntEquals(values: Iterable<Int>, varName: String = ""): Array<String> {
+    val conditions = mutableListOf<String>()
+
+    var rangeStart = 0
+    var rangeSize = 0
+
+    val equalsPrefix = if (varName.isEmpty()) "" else {
+      "$varName == "
+    }
+    val inPrefix = if (varName.isEmpty()) "" else {
+      "$varName "
+    }
+
+    val addRange: () -> Unit = {
+      if (rangeSize == 1) {
+        conditions.add("${equalsPrefix}0x${rangeStart.toString(16)}")
+      } else if (rangeSize == 2) {
+        conditions.add("${equalsPrefix}0x${rangeStart.toString(16)}")
+        conditions.add("${equalsPrefix}0x${(rangeStart + 1).toString(16)}")
+      } else if (rangeSize > 2) {
+        conditions.add("${inPrefix}in 0x${rangeStart.toString(16)}..0x${(rangeStart + rangeSize - 1).toString(16)}")
+      }
+      rangeSize = 0
+    }
+
+    var prev = 0
+    values.forEachIndexed { index, value ->
+      if (index == 0 || value - prev != 1) {
+        addRange()
+        rangeStart = value
+        rangeSize++
+      } else if (value - prev == 1) {
+        rangeSize++
+      }
+      prev = value
+    }
+    addRange()
+
+    return conditions.toTypedArray()
+  }
+
   private fun emojiSignature(emoji: String?): String {
     return emoji?.let {
       "$emoji (${hex(emoji)})"
@@ -117,6 +162,39 @@ open class CheckEmojiKeyboardTask : BaseTask() {
     return duplicates
   }
 
+  enum class TextDirection {
+    NEUTRAL,
+    LTR,
+    RTL
+  }
+  
+  private fun getTextDirection (codePoint: Int): TextDirection {
+    val directionality = Character.getDirectionality(codePoint)
+    return when (directionality) {
+      Character.DIRECTIONALITY_LEFT_TO_RIGHT,
+      Character.DIRECTIONALITY_LEFT_TO_RIGHT_EMBEDDING,
+      Character.DIRECTIONALITY_LEFT_TO_RIGHT_OVERRIDE -> TextDirection.LTR
+      Character.DIRECTIONALITY_RIGHT_TO_LEFT,
+      Character.DIRECTIONALITY_RIGHT_TO_LEFT_ARABIC,
+      Character.DIRECTIONALITY_RIGHT_TO_LEFT_EMBEDDING,
+      Character.DIRECTIONALITY_RIGHT_TO_LEFT_OVERRIDE -> TextDirection.RTL
+      else -> TextDirection.NEUTRAL
+    }
+  }
+
+  private fun getTextDirection (str: String): TextDirection {
+    var index = 0
+    while (index < str.length) {
+      val codePoint = str.codePointAt(index)
+      val direction = getTextDirection(codePoint)
+      if (direction != TextDirection.NEUTRAL) {
+        return direction
+      }
+      index += Character.charCount(codePoint)
+    }
+    return TextDirection.NEUTRAL
+  }
+
   @ExperimentalContracts
   @TaskAction
   fun checkEmojiKeyboard () {
@@ -182,6 +260,7 @@ open class CheckEmojiKeyboardTask : BaseTask() {
     for (chunk in supported) {
       for (emoji in chunk) {
         maxEmojiLength = maxOf(maxEmojiLength, emoji.length)
+
         val toned = findTones(emoji/*, defaultSkinTone*/)
         val originalEmoji = tone2dAliases[toned.first] ?: toned.first
         val tones = toned.second
@@ -396,6 +475,143 @@ open class CheckEmojiKeyboardTask : BaseTask() {
           }
         }
       """.trimIndent())
+    }
+
+    for (i in 0 .. 1) {
+      val isLegacy = i == 1
+      val legacySuffix = if (isLegacy) {
+        "Legacy"
+      } else {
+        ""
+      }
+
+      val ltrEmoji = mutableSetOf<String>()
+      var maxLtrEmojiLength = 0
+
+      for (chunk in supported) {
+        for (emoji in chunk) {
+          var emojiDirection = getTextDirection(emoji)
+          if (isLegacy) {
+            if (emojiDirection != TextDirection.NEUTRAL) {
+              continue
+            }
+            val toned = findTones(emoji/*, defaultSkinTone*/)
+            val tones = toned.second
+            if (!tones.isNullOrEmpty()) {
+              continue
+            }
+            val chars = emoji.toCharArray()
+            for (c in chars) {
+              val surrogateDirection = getTextDirection(c.code)
+              if (surrogateDirection != TextDirection.NEUTRAL) {
+                emojiDirection = surrogateDirection
+              }
+            }
+          }
+          when (emojiDirection) {
+            TextDirection.LTR -> {
+              val codePointCount = emoji.codePointCount(0, emoji.length)
+              if (codePointCount > 2) {
+                if (isLegacy) {
+                  continue
+                }
+                error("Unsupported long ltr emoji: ${emojiSignature(emoji)}")
+              }
+              ltrEmoji.add(emoji)
+              maxLtrEmojiLength = maxOf(maxLtrEmojiLength, emoji.length)
+            }
+            TextDirection.RTL -> error("Unexpected RTL emoji: ${emojiSignature(emoji)}")
+            TextDirection.NEUTRAL -> { /*do nothing*/ }
+          }
+        }
+      }
+
+      val singleLtrEmojiCodePoints = sortedSetOf<Int>()
+      val doubleLtrEmojiCodePoints = sortedMapOf<Int, MutableSet<Int>>()
+      val secondLtrEmojiCodePointToFirstCodePoint = sortedMapOf<Int, MutableSet<Int>>()
+      ltrEmoji.forEach { emoji ->
+        val codePointCount = emoji.codePointCount(0, emoji.length)
+        val firstCodePoint = emoji.codePointAt(0)
+        if (codePointCount == 1) {
+          if (doubleLtrEmojiCodePoints.containsKey(firstCodePoint)) {
+            error("Single ltr emoji already has double entry: ${emojiSignature(emoji)}")
+          }
+          singleLtrEmojiCodePoints.add(firstCodePoint)
+        } else if (codePointCount == 2) {
+          if (singleLtrEmojiCodePoints.contains(firstCodePoint)) {
+            error("Double ltr emoji already has single entry: ${emojiSignature(emoji)}")
+          }
+          val secondCodePoint = emoji.codePointAt(Character.charCount(firstCodePoint))
+          val list = doubleLtrEmojiCodePoints[firstCodePoint]
+          if (list != null) {
+            list.add(secondCodePoint)
+          } else {
+            doubleLtrEmojiCodePoints[firstCodePoint] = sortedSetOf(secondCodePoint)
+          }
+          val set = secondLtrEmojiCodePointToFirstCodePoint[secondCodePoint]
+          if (set != null) {
+            set.add(firstCodePoint)
+          } else {
+            secondLtrEmojiCodePointToFirstCodePoint[secondCodePoint] = sortedSetOf(firstCodePoint)
+          }
+        } else {
+          error("Unsupported long ltr emoji: ${emojiSignature(emoji)}")
+        }
+      }
+      writeToFile("app/src/main/java/org/thunderdog/challegram/tool/EmojiBidi${legacySuffix}.kt") { kt ->
+        kt.append("""
+        @file:JvmName("EmojiBidUtil${legacySuffix}")
+
+        package org.thunderdog.challegram.tool
+
+        import me.vkryl.annotation.Autogenerated
+        
+        const val MAX_LTR_EMOJI_LENGTH${if (isLegacy) "_LEGACY" else ""} = ${maxLtrEmojiLength}
+        
+        ${if (doubleLtrEmojiCodePoints.isEmpty()) "" else """@Autogenerated private fun isKnownLtrEmoji${legacySuffix} (codePoint: Int, nextCodePoint: Int): Boolean = ${ if (doubleLtrEmojiCodePoints.isEmpty()) "false" else {
+          """if ((${ ktCheckIntEquals(doubleLtrEmojiCodePoints.keys, "codePoint").joinToString(" || ") }) && (${ ktCheckIntEquals(secondLtrEmojiCodePointToFirstCodePoint.keys, "nextCodePoint").joinToString(" || ") })) {
+          when (codePoint) {
+            ${doubleLtrEmojiCodePoints.entries.joinToString("\n            ") { entry ->
+            "0x${entry.key.toString(16)} -> when (nextCodePoint) {" + "\n              " +
+              ktCheckIntEquals(entry.value).joinToString(",\n              ") + " -> true\n              " +
+              "else -> false\n            " +
+              "}"
+          } }
+            else -> false
+          }
+        } else {
+          false
+        }"""
+        }
+        }
+        
+        """}@Autogenerated fun ltrEmojiCharCount${legacySuffix} (codePoint: Int, codePointSize: Int${if(doubleLtrEmojiCodePoints.isEmpty()) "" else ", str: String, start: Int, end: Int"}): Int = when (codePoint) {
+          ${ ktCheckIntEquals(singleLtrEmojiCodePoints).joinToString(",\n          ") } -> {
+            codePointSize
+          }
+          ${ ktCheckIntEquals(doubleLtrEmojiCodePoints.keys).joinToString(",\n        ") }${ if (doubleLtrEmojiCodePoints.isEmpty()) "" else {
+          """ -> {
+            if (start + codePointSize < end) {
+              val nextCodePoint = str.codePointAt(start + codePointSize)
+              if (isKnownLtrEmoji${legacySuffix}(codePoint, nextCodePoint)) {
+                val nextCodePointSize = Character.charCount(nextCodePoint)
+                codePointSize + nextCodePointSize
+              } else {
+                0
+              }
+            } else {
+              0
+            }
+          }"""
+          } }
+          else -> 0
+        }
+        
+        @Autogenerated fun ltrSet${legacySuffix} () = setOf(
+          ${ltrEmoji.sorted().joinToString(",\n          ") { javaWrap(it) }}
+        )
+      """.trimIndent())
+      }
     }
   }
 }

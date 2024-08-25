@@ -22,6 +22,7 @@ import android.text.Spannable;
 import android.text.SpannableStringBuilder;
 import android.text.Spanned;
 import android.text.method.LinkMovementMethod;
+import android.util.Base64;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
@@ -324,6 +325,57 @@ public class PasswordController extends ViewController<PasswordController.Args> 
     return R.drawable.baseline_arrow_forward_24;
   }
 
+  private void updateAuthInputType () {
+    switch (mode) {
+      case MODE_2FA_RECOVERY_EMAIL_CHANGE:
+      case MODE_LOGIN_EMAIL_CHANGE:
+      case MODE_EMAIL_LOGIN: {
+        editText.getEditText().setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS);
+        break;
+      }
+      case MODE_EMAIL_RECOVERY:
+      case MODE_LOGIN_EMAIL_RECOVERY:
+      case MODE_CODE:
+      case MODE_CODE_CHANGE:
+      case MODE_CODE_PHONE_CONFIRM:
+      case MODE_CODE_EMAIL: {
+        TdApi.AuthenticationCodeType codeType = authenticationCodeType();
+        if (codeType == null) {
+          codeType = new TdApi.AuthenticationCodeTypeSms();
+        }
+        switch (codeType.getConstructor()) {
+          // Digit-only
+          case TdApi.AuthenticationCodeTypeTelegramMessage.CONSTRUCTOR:
+          case TdApi.AuthenticationCodeTypeSms.CONSTRUCTOR:
+          case TdApi.AuthenticationCodeTypeCall.CONSTRUCTOR:
+          case TdApi.AuthenticationCodeTypeFlashCall.CONSTRUCTOR:
+          case TdApi.AuthenticationCodeTypeMissedCall.CONSTRUCTOR:
+          case TdApi.AuthenticationCodeTypeFragment.CONSTRUCTOR:
+          case TdApi.AuthenticationCodeTypeFirebaseAndroid.CONSTRUCTOR:
+          case TdApi.AuthenticationCodeTypeFirebaseIos.CONSTRUCTOR:
+            editText.getEditText().setInputType(InputType.TYPE_CLASS_NUMBER);
+            break;
+          // Word-based
+          case TdApi.AuthenticationCodeTypeSmsWord.CONSTRUCTOR:
+          case TdApi.AuthenticationCodeTypeSmsPhrase.CONSTRUCTOR:
+            editText.getEditText().setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+            break;
+          default:
+            Td.assertAuthenticationCodeType_6b7089f4();
+            throw Td.unsupported(codeType);
+        }
+        break;
+      }
+      default: {
+        // editText.getEditText().setInputType(InputType.TYPE_PASSWORD);
+        // editText.getEditText().setIsPassword();
+        editText.getEditText().setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        editText.getEditText().setIsPassword(true);
+        break;
+      }
+    }
+  }
+
   @Override
   protected View onCreateView (Context context) {
     final FrameLayoutFix contentView = new FrameLayoutFix(context);
@@ -338,36 +390,13 @@ public class PasswordController extends ViewController<PasswordController.Args> 
     params.leftMargin = Screen.dp(16f);
     params.rightMargin = Screen.dp(16f);
 
-    editText = new MaterialEditTextGroup(context);
+    editText = new MaterialEditTextGroup(context, tdlib);
     editText.getEditText().setImeOptions(EditorInfo.IME_FLAG_NO_EXTRACT_UI | EditorInfo.IME_ACTION_DONE);
     editText.addThemeListeners(this);
     editText.setDoneListener(this);
     editText.setEmptyListener(this);
     editText.setTextListener(this);
-    switch (mode) {
-      case MODE_2FA_RECOVERY_EMAIL_CHANGE:
-      case MODE_LOGIN_EMAIL_CHANGE:
-      case MODE_EMAIL_LOGIN: {
-        editText.getEditText().setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS);
-        break;
-      }
-      case MODE_EMAIL_RECOVERY:
-      case MODE_LOGIN_EMAIL_RECOVERY:
-      case MODE_CODE:
-      case MODE_CODE_CHANGE:
-      case MODE_CODE_PHONE_CONFIRM:
-      case MODE_CODE_EMAIL: {
-        editText.getEditText().setInputType(InputType.TYPE_CLASS_NUMBER);
-        break;
-      }
-      default: {
-        // editText.getEditText().setInputType(InputType.TYPE_PASSWORD);
-        // editText.getEditText().setIsPassword();
-        editText.getEditText().setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
-        editText.getEditText().setIsPassword(true);
-        break;
-      }
-    }
+    updateAuthInputType();
 
     switch (mode) {
       case MODE_EMAIL_RECOVERY:
@@ -616,75 +645,102 @@ public class PasswordController extends ViewController<PasswordController.Args> 
     return contentView;
   }
 
-  private String lastSafetyNetError;
-
   private void sendFirebaseSmsIfNeeded (boolean forced) {
     TdApi.AuthenticationCodeType codeType = authenticationCodeType();
     if (codeType == null || codeType.getConstructor() != TdApi.AuthenticationCodeTypeFirebaseAndroid.CONSTRUCTOR || isFirebaseSmsSent) {
       return;
     }
     TdApi.AuthenticationCodeTypeFirebaseAndroid firebase = (TdApi.AuthenticationCodeTypeFirebaseAndroid) codeType;
+    RunnableData<String> onVerificationFailure = errorMessage -> {
+      lastVerificationError = errorMessage;
+      if (forced) {
+        TDLib.Tag.integrity(firebase.usePlayIntegrity, "Avoiding infinite loop, because verification failed twice");
+        onDeadEndReached();
+      } else {
+        TDLib.Tag.integrity(firebase.usePlayIntegrity, "Force resend code, ignoring whether codeInfo.nextCodeType is null or not");
+        requestNextCodeType(new TdApi.ResendCodeReasonVerificationFailed(errorMessage), true);
+      }
+    };
+    if (firebase.usePlayIntegrity) {
+      sendFirebaseSmsViaPlayIntegrity(firebase, onVerificationFailure);
+    } else {
+      sendFirebaseSmsViaSafetyNet(firebase, onVerificationFailure);
+    }
+  }
+
+  private void handleVerificationResult (boolean isPlay, boolean isError, String result, RunnableData<String> onVerificationFailure) {
+    if (isError) {
+      TDLib.Tag.integrity(isPlay, "Verification error: %s", result);
+      onVerificationFailure.runWithData(result);
+      return;
+    }
+    if (StringUtils.isEmpty(result)) {
+      TDLib.Tag.integrity(isPlay, "Verification successful, but empty: %s", result);
+      onVerificationFailure.runWithData(result);
+      return;
+    }
+
+    TDLib.Tag.integrity(isPlay, "Verification success: %s", result);
+    TdApi.Function<TdApi.Ok> function;
+    switch (mode) {
+      case MODE_CODE_PHONE_CONFIRM:
+      case MODE_CODE_CHANGE:
+        function = new TdApi.SendPhoneNumberFirebaseSms(result);
+        break;
+      default:
+        function = new TdApi.SendAuthenticationFirebaseSms(result);
+        break;
+    }
+    tdlib.send(function, (ok, error) -> {
+      runOnUiThreadOptional(() -> {
+        if (error != null) {
+          String errorMessage = TD.toErrorString(error);
+          TDLib.Tag.integrity(isPlay, "Verified API request failed by server, retrying once: %s", error);
+          onVerificationFailure.runWithData(errorMessage);
+        } else {
+          isFirebaseSmsSent = true;
+          updateAuthState(false);
+          TDLib.Tag.integrity(isPlay, "Verification finished successfully");
+        }
+      });
+    });
+  }
+
+  private String lastVerificationError;
+
+  private void sendFirebaseSmsViaSafetyNet (TdApi.AuthenticationCodeTypeFirebaseAndroid firebase, RunnableData<String> onVerificationError) {
     String safetyNetApiKey = tdlib.safetyNetApiKey();
     if (StringUtils.isEmpty(safetyNetApiKey)) {
       TDLib.Tag.safetyNet("Requesting next code type, because SafetyNet API_KEY is unavailable");
-      requestNextCodeType(false, false);
+      requestNextCodeType(new TdApi.ResendCodeReasonVerificationFailed("SAFETYNET_API_KEY_EMPTY"), false);
       return;
     }
     if (Config.REQUIRE_FIREBASE_SERVICES_FOR_SAFETYNET && !U.isGooglePlayServicesAvailable(context)) {
       TDLib.Tag.safetyNet("Requesting next code type, because Firebase services are unavailable");
-      requestNextCodeType(false, false);
+      requestNextCodeType(new TdApi.ResendCodeReasonVerificationFailed("GOOGLE_PLAY_SERVICES_UNAVAILABLE"), false);
       return;
     }
-    Runnable onAttestationFailure = () -> {
-      if (forced) {
-        TDLib.Tag.safetyNet("Avoiding infinite loop, because attestation failed twice");
-        onDeadEndReached();
-      } else {
-        TDLib.Tag.safetyNet("Force resend code, ignoring whether codeInfo.nextCodeType is null or not");
-        requestNextCodeType(false, true);
-      }
-    };
     //noinspection ConstantConditions
     SafetyNet.getClient(context)
       .attest(firebase.nonce, safetyNetApiKey)
       .addOnSuccessListener(attestationSuccess -> {
-        String attestationResult = attestationSuccess.getJwsResult();
-        if (StringUtils.isEmpty(attestationResult)) {
-          TDLib.Tag.safetyNet("Attestation success, but result is empty");
-          lastSafetyNetError = "EMPTY_JWS_RESULT";
-          executeOnUiThreadOptional(onAttestationFailure);
-        } else {
-          TDLib.Tag.safetyNet("Attestation success: %s", attestationResult);
-          TdApi.Function<TdApi.Ok> function;
-          switch (mode) {
-            case MODE_CODE_PHONE_CONFIRM:
-            case MODE_CODE_CHANGE:
-              function = new TdApi.SendPhoneNumberFirebaseSms(attestationResult);
-              break;
-            default:
-              function = new TdApi.SendAuthenticationFirebaseSms(attestationResult);
-              break;
-          }
-          tdlib.send(function, (ok, error) -> {
-            runOnUiThreadOptional(() -> {
-              if (error != null) {
-                lastSafetyNetError = TD.toErrorString(error);
-                TDLib.Tag.safetyNet("Attestation failed by server, retrying once: %s", TD.toErrorString(error));
-                requestNextCodeType(false, true);
-              } else {
-                isFirebaseSmsSent = true;
-                updateAuthState();
-                TDLib.Tag.safetyNet("Attestation finished successfully");
-              }
-            });
-          });
-        }
+        String result = attestationSuccess.getJwsResult();
+        handleVerificationResult(false, false, result, onVerificationError);
       })
       .addOnFailureListener(attestationError -> {
-        lastSafetyNetError = attestationError.getMessage();
-        TDLib.Tag.safetyNet("Attestation failed with error: %s", attestationError.getMessage());
-        executeOnUiThreadOptional(onAttestationFailure);
+        String error = attestationError.getMessage();
+        TDLib.Tag.safetyNet("Attestation failed with error: %s", error);
+        executeOnUiThreadOptional(() ->
+          onVerificationError.runWithData(error)
+        );
       });
+  }
+
+  private void sendFirebaseSmsViaPlayIntegrity (TdApi.AuthenticationCodeTypeFirebaseAndroid firebase, RunnableData<String> onAttestationFailure) {
+    String nonce = Base64.encodeToString(firebase.nonce, Base64.NO_PADDING);
+    tdlib.requestPlayIntegrity(-1, nonce, (result, isError) -> {
+      handleVerificationResult(true, isError, result, onAttestationFailure);
+    });
   }
 
   @Override
@@ -692,7 +748,7 @@ public class PasswordController extends ViewController<PasswordController.Args> 
     runOnUiThreadOptional(() -> {
       this.authState = authorizationState;
       this.isFirebaseSmsSent = false;
-      updateAuthState();
+      updateAuthState(true);
     });
   }
 
@@ -733,6 +789,22 @@ public class PasswordController extends ViewController<PasswordController.Args> 
         }
         return Strings.replaceBoldTokens(Lang.getString(resId, formattedPhone), ColorId.textLight);
       }
+      case TdApi.AuthenticationCodeTypeSmsWord.CONSTRUCTOR: {
+        TdApi.AuthenticationCodeTypeSmsWord word = (TdApi.AuthenticationCodeTypeSmsWord) type;
+        if (StringUtils.isEmpty(word.firstLetter)) {
+          return Lang.getStringBold(R.string.SentSmsWord, formattedPhone);
+        } else {
+          return Lang.getStringBold(R.string.SentSmsWordHint, formattedPhone, word.firstLetter);
+        }
+      }
+      case TdApi.AuthenticationCodeTypeSmsPhrase.CONSTRUCTOR: {
+        TdApi.AuthenticationCodeTypeSmsPhrase phrase = (TdApi.AuthenticationCodeTypeSmsPhrase) type;
+        if (StringUtils.isEmpty(phrase.firstWord)) {
+          return Lang.getStringBold(R.string.SentSmsPhrase, formattedPhone);
+        } else {
+          return Lang.getStringBold(R.string.SentSmsPhraseHint, formattedPhone, phrase.firstWord);
+        }
+      }
       case TdApi.AuthenticationCodeTypeMissedCall.CONSTRUCTOR: {
         TdApi.AuthenticationCodeTypeMissedCall missedCall = (TdApi.AuthenticationCodeTypeMissedCall) type;
         editText.setHint(Lang.pluralBold(R.string.login_LastDigits, missedCall.length));
@@ -755,10 +827,12 @@ public class PasswordController extends ViewController<PasswordController.Args> 
         }
         return b;
       }
-      case TdApi.AuthenticationCodeTypeFirebaseIos.CONSTRUCTOR:
-        break; // Unreachable
+      case TdApi.AuthenticationCodeTypeFirebaseIos.CONSTRUCTOR: // unreachable
+      default:
+        Td.assertAuthenticationCodeType_6b7089f4();
+        break;
     }
-    throw new UnsupportedOperationException(type.toString());
+    throw Td.unsupported(type);
   }
 
   @Override
@@ -779,12 +853,17 @@ public class PasswordController extends ViewController<PasswordController.Args> 
         setIsInputOK(Strings.isValidEmail(text));
       }
     } else if (mode == MODE_EMAIL_RECOVERY || mode == MODE_LOGIN_EMAIL_RECOVERY) {
-      setIsInputOK(Strings.getNumber(text).length() >= 6);
-    } else if ((mode == MODE_CODE || mode == MODE_CODE_CHANGE || mode == MODE_CODE_PHONE_CONFIRM || mode == MODE_CODE_EMAIL) && Strings.getNumberLength(text) >= TD.getCodeLength(authState)) {
+      setIsInputOK(Strings.getNumber(text).length() >= EMAIL_RECOVERY_CODE_LENGTH);
+    } else if ((mode == MODE_CODE || mode == MODE_CODE_CHANGE || mode == MODE_CODE_PHONE_CONFIRM || mode == MODE_CODE_EMAIL) && checkCodeLength(authState, text)) {
       proceed();
     } else if ((mode == MODE_NEW || mode == MODE_EDIT) && step == STEP_PASSWORD_HINT) {
       passwordHint = text;
     }
+  }
+
+  private static boolean checkCodeLength (TdApi.AuthorizationState state, String text) {
+    int expectedCodeLength = TD.codeLength(state, 0);
+    return expectedCodeLength > 0 && Strings.codePointCount(text) >= expectedCodeLength;
   }
 
   private boolean ignoreNextEmpty;
@@ -970,12 +1049,15 @@ public class PasswordController extends ViewController<PasswordController.Args> 
     return null;
   }
 
-  private void updateAuthState () {
+  private void updateAuthState (boolean typeChanged) {
     TdApi.AuthenticationCodeType authenticationCodeType = authenticationCodeType();
     if (authenticationCodeType != null) {
       hintView.setText(getCodeHint(authenticationCodeType, formattedPhone));
       if (!hasNextCodeType()) {
         setForgetText(null);
+      }
+      if (typeChanged) {
+        updateAuthInputType();
       }
     }
     sendFirebaseSmsIfNeeded(false);
@@ -1000,7 +1082,7 @@ public class PasswordController extends ViewController<PasswordController.Args> 
                 Lang.getStringSecure(R.string.email_SmsHelp),
                 Lang.getStringSecure(R.string.email_LoginDeadEnd_subject, formattedPhone),
                 Lang.getStringSecure(R.string.email_LoginDeadEnd_text, formattedPhone, U.getUsefulMetadata(tdlib)),
-                StringUtils.isEmpty(lastSafetyNetError) ? "none" : lastSafetyNetError
+                StringUtils.isEmpty(lastVerificationError) ? "none" : lastVerificationError
               );
             }
           }, start, end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
@@ -1011,10 +1093,12 @@ public class PasswordController extends ViewController<PasswordController.Args> 
     setHint(message, true);
   }
 
-  private void requestNextCodeType (boolean byUser, boolean force) {
+  private void requestNextCodeType (TdApi.ResendCodeReason reason, boolean force) {
     if (inRecoveryProgress) {
       return;
     }
+
+    boolean byUser = reason.getConstructor() == TdApi.ResendCodeReasonUserRequest.CONSTRUCTOR;
 
     if (!hasNextCodeType() && !force) {
       if (!byUser) {
@@ -1033,10 +1117,10 @@ public class PasswordController extends ViewController<PasswordController.Args> 
     switch (mode) {
       case MODE_CODE_PHONE_CONFIRM:
       case MODE_CODE_CHANGE:
-        function = new TdApi.ResendPhoneNumberCode();
+        function = new TdApi.ResendPhoneNumberCode(reason);
         break;
       default:
-        function = new TdApi.ResendAuthenticationCode();
+        function = new TdApi.ResendAuthenticationCode(reason);
         break;
     }
     tdlib.client().send(function, object -> runOnUiThreadOptional(() -> {
@@ -1048,7 +1132,7 @@ public class PasswordController extends ViewController<PasswordController.Args> 
         case TdApi.AuthenticationCodeInfo.CONSTRUCTOR: {
           ((TdApi.AuthorizationStateWaitCode) authState).codeInfo = (TdApi.AuthenticationCodeInfo) object;
           isFirebaseSmsSent = false;
-          updateAuthState();
+          updateAuthState(true);
           sendFirebaseSmsIfNeeded(force);
           break;
         }
@@ -1663,6 +1747,8 @@ public class PasswordController extends ViewController<PasswordController.Args> 
     }));
   }
 
+  private static final int EMAIL_RECOVERY_CODE_LENGTH = 6;
+
   private void proceed () {
     String input = editText.getText().toString();
     switch (mode) {
@@ -1684,7 +1770,7 @@ public class PasswordController extends ViewController<PasswordController.Args> 
       case MODE_EMAIL_RECOVERY:
       case MODE_LOGIN_EMAIL_RECOVERY: {
         String number = Strings.getNumber(input);
-        if (number.length() >= 6) {
+        if (number.length() >= EMAIL_RECOVERY_CODE_LENGTH) {
           recover(number);
         }
         break;
@@ -1794,7 +1880,7 @@ public class PasswordController extends ViewController<PasswordController.Args> 
       case MODE_CODE_CHANGE:
       case MODE_CODE_PHONE_CONFIRM:
       case MODE_CODE_EMAIL: {
-        requestNextCodeType(true, false);
+        requestNextCodeType(new TdApi.ResendCodeReasonUserRequest(), false);
         break;
       }
       case MODE_CONFIRM:

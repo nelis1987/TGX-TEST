@@ -28,6 +28,7 @@ import org.drinkless.tdlib.TdApi;
 import org.thunderdog.challegram.R;
 import org.thunderdog.challegram.component.dialogs.ChatView;
 import org.thunderdog.challegram.core.Lang;
+import org.thunderdog.challegram.loader.AvatarReceiver;
 import org.thunderdog.challegram.loader.ComplexReceiver;
 import org.thunderdog.challegram.loader.ImageFile;
 import org.thunderdog.challegram.loader.Receiver;
@@ -85,11 +86,15 @@ public class DoubleTextWrapper implements MessageSourceProvider, UserProvider, T
 
   private final MultipleViewProvider currentViews = new MultipleViewProvider();
   private final BounceAnimator isAnonymous = new BounceAnimator(currentViews);
-  private final int horizontalPadding;
+  private final int horizontalPadding = Screen.dp(72f) + Screen.dp(11f);
+  private boolean forceSingleLine, allowSavedMessages;
 
   public DoubleTextWrapper (Tdlib tdlib, TdApi.Chat chat) {
+    this(tdlib, chat, /* needSubtitle */ true, false);
+  }
+
+  public DoubleTextWrapper (Tdlib tdlib, TdApi.Chat chat, boolean needSubtitle, boolean allowSavedMessages) {
     this.tdlib = tdlib;
-    this.horizontalPadding = Screen.dp(72f) + Screen.dp(11f);
 
     this.chatId = chat.id;
     this.userId = TD.getUserId(chat);
@@ -102,17 +107,23 @@ public class DoubleTextWrapper implements MessageSourceProvider, UserProvider, T
       setChatMark(false, false);
     }
 
-    setTitle(chat.title);
-    this.avatarPlaceholder = tdlib.chatPlaceholder(chat, false, AVATAR_PLACEHOLDER_RADIUS, null);
+    if (allowSavedMessages || !tdlib.isUserChat(chat)) {
+      setTitle(tdlib.chatTitle(chat));
+    } else {
+      setTitle(tdlib.cache().userName(tdlib.chatUserId(chat)));
+    }
+    this.allowSavedMessages = allowSavedMessages;
+    this.avatarPlaceholder = tdlib.chatPlaceholder(chat, allowSavedMessages, AVATAR_PLACEHOLDER_RADIUS, null);
     if (chat.photo != null) {
       setPhoto(chat.photo.small);
     }
-    updateSubtitle();
+    if (needSubtitle) {
+      updateSubtitle();
+    }
   }
 
   public DoubleTextWrapper (Tdlib tdlib, long userId, boolean needSubtitle) {
     this.tdlib = tdlib;
-    this.horizontalPadding = Screen.dp(72f) + Screen.dp(11f);
 
     this.userId = userId;
     this.user = tdlib.cache().user(userId);
@@ -125,6 +136,18 @@ public class DoubleTextWrapper implements MessageSourceProvider, UserProvider, T
     }
     if (needSubtitle) {
       updateSubtitle();
+    }
+  }
+
+  public DoubleTextWrapper (Tdlib tdlib, String title, CharSequence subtitle, AvatarPlaceholder.Metadata metadata) {
+    this.tdlib = tdlib;
+    this.userId = 0;
+    setTitle(title);
+    this.avatarPlaceholder = new AvatarPlaceholder(AVATAR_PLACEHOLDER_RADIUS, metadata, null);
+    if (StringUtils.isEmpty(subtitle)) {
+      forceSingleLine = true;
+    } else {
+      setForcedSubtitle(subtitle);
     }
   }
 
@@ -246,6 +269,10 @@ public class DoubleTextWrapper implements MessageSourceProvider, UserProvider, T
     }
   }
 
+  public @Nullable String getTitle () {
+    return title;
+  }
+
   public void updateSubtitle () {
     CharSequence description = needFullDescription ? TD.getMemberDescription(new TdlibContext(null, tdlib), memberInfo, false) : null;
     if (!StringUtils.isEmpty(description)) {
@@ -323,6 +350,13 @@ public class DoubleTextWrapper implements MessageSourceProvider, UserProvider, T
 
   public @Nullable TdApi.ChatMessageSender getChatMessageSender () {
     return chatMessageSender;
+  }
+
+  public void setForceSingleLine (boolean forceSingleLine) {
+    if (this.forceSingleLine != forceSingleLine) {
+      this.forceSingleLine = forceSingleLine;
+      currentViews.invalidate();
+    }
   }
 
   private CharSequence forcedSubtitle;
@@ -467,6 +501,20 @@ public class DoubleTextWrapper implements MessageSourceProvider, UserProvider, T
     this.trimmedTitle = StringUtils.isEmpty(title) ? null : new Text.Builder(title, availWidth, Paints.robotoStyleProvider(15), TextColorSets.Regular.NORMAL).allBold().singleLine().build();
   }
 
+  public void requestAvatar (AvatarReceiver receiver) {
+    TdApi.MessageSender sender = getSenderId();
+    AvatarPlaceholder placeholder = getAvatarPlaceholder();
+    if (allowSavedMessages && getChatId() != 0) {
+      receiver.requestChat(tdlib, getChatId(), AvatarReceiver.Options.NONE);
+    } else if (sender != null) {
+      receiver.requestMessageSender(tdlib, sender, AvatarReceiver.Options.NONE);
+    } else if (placeholder != null) {
+      receiver.requestPlaceholder(tdlib, placeholder.metadata, AvatarReceiver.Options.NONE);
+    } else {
+      receiver.clear();
+    }
+  }
+
   public void invalidateEmojiStatusReceiver (Text text, @Nullable TextMedia specificMedia) {
     currentViews.performWithViews(view -> {
       if (view instanceof EmojiStatusHelper.EmojiStatusReceiverInvalidateDelegate) {
@@ -547,7 +595,6 @@ public class DoubleTextWrapper implements MessageSourceProvider, UserProvider, T
         double radians = Math.toRadians(45f);
         float cx = receiver.centerX() + (float) ((double) (receiver.getWidth() / 2) * Math.sin(radians));
         float cy = receiver.centerY() + (float) ((double) (receiver.getHeight() / 2) * Math.cos(radians));
-        c.drawCircle(cx, cy, Screen.dp(11.5f), Paints.fillingPaint(Theme.fillingColor()));
         int backgroundColor = Theme.textDecentColor();
         c.drawCircle(cx, cy, Screen.dp(10f), Paints.fillingPaint(backgroundColor));
         c.save();
@@ -557,6 +604,12 @@ public class DoubleTextWrapper implements MessageSourceProvider, UserProvider, T
         c.drawRect(cx - h, cy - lineSize / 2f, cx + h, cy + lineSize / 2f, Paints.fillingPaint(color));
         c.drawRect(cx - lineSize / 2f, cy - h, cx + lineSize / 2f, cy + h, Paints.fillingPaint(color));
         c.restore();
+
+        RectF rectF = Paints.getRectF();
+        int radius = Screen.dp(11f);
+        float sweepFactor = 1f;
+        rectF.set(cx - radius, cy - radius, cx + radius, cy + radius);
+        c.drawArc(rectF, Lang.rtl() ? 225f + 170f * (1f - sweepFactor) : 135f, 170f * sweepFactor, false, Paints.getOuterCheckPaint(Theme.fillingColor()));
       }
     }
     if (drawAnonymousIcon) {
@@ -571,13 +624,18 @@ public class DoubleTextWrapper implements MessageSourceProvider, UserProvider, T
       float y = receiver.centerY();
       Drawables.draw(c, incognitoIcon, x, y - incognitoIcon.getMinimumHeight() / 2f, PorterDuffPaint.get(ColorId.text));
     }
+
+    int titleY = Screen.dp(13f);
     int offset = 0;
     if (trimmedTitle != null) {
-      trimmedTitle.draw(c, left, Screen.dp(13f));
+      if (forceSingleLine) {
+        titleY = view.getMeasuredHeight() / 2 - trimmedTitle.getHeight() / 2;
+      }
+      trimmedTitle.draw(c, left, titleY);
       offset += trimmedTitle.getWidth();
     }
     if (emojiStatusDrawable != null) {
-      emojiStatusDrawable.draw(c, left + offset + Screen.dp(6f), Screen.dp(13f), 1f, emojiStatusReceiver);
+      emojiStatusDrawable.draw(c, left + offset + Screen.dp(6f), titleY, 1f, emojiStatusReceiver);
       offset += emojiStatusDrawable.getWidth(Screen.dp(6f));
     }
 
@@ -585,17 +643,17 @@ public class DoubleTextWrapper implements MessageSourceProvider, UserProvider, T
       adminSign.draw(c, viewWidth - Screen.dp(14f) - adminSign.getWidth(), view.getMeasuredHeight() / 2 - adminSign.getHeight() / 2, memberInfo != null && TD.isCreator(memberInfo.status) ? TextColorSets.Regular.NEUTRAL : null);
     }
 
-    if (trimmedSubtitle != null) {
+    if (!forceSingleLine && trimmedSubtitle != null) {
       trimmedSubtitle.draw(c, left, Screen.dp(33f), isOnline ? TextColorSets.Regular.NEUTRAL : null);
     }
 
     if (trimmedTitle != null && chatMark != null) {
       int cmLeft = left + offset + Screen.dp(6f);
       RectF rct = Paints.getRectF();
-      rct.set(cmLeft, Screen.dp(13f), cmLeft + chatMark.getWidth() + Screen.dp(8f), Screen.dp(13f) + trimmedTitle.getLineHeight(false));
+      rct.set(cmLeft, titleY, cmLeft + chatMark.getWidth() + Screen.dp(8f), titleY + trimmedTitle.getLineHeight(false));
       c.drawRoundRect(rct, Screen.dp(2f), Screen.dp(2f), Paints.getProgressPaint(Theme.getColor(ColorId.textNegative), Screen.dp(1.5f)));
       cmLeft += Screen.dp(4f);
-      chatMark.draw(c, cmLeft, cmLeft + chatMark.getWidth(), 0, Screen.dp(13f) + ((trimmedTitle.getLineHeight(false) - chatMark.getLineHeight(false)) / 2));
+      chatMark.draw(c, cmLeft, cmLeft + chatMark.getWidth(), 0, titleY + ((trimmedTitle.getLineHeight(false) - chatMark.getLineHeight(false)) / 2));
     }
   }
 

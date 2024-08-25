@@ -37,9 +37,9 @@ import androidx.annotation.IntDef;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.StringRes;
+import androidx.annotation.UiThread;
 import androidx.collection.LongSparseArray;
 import androidx.core.os.CancellationSignal;
-import androidx.core.view.ViewCompat;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
@@ -150,7 +150,6 @@ import java.io.FileReader;
 import java.io.IOException;
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
-import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Collections;
@@ -169,6 +168,7 @@ import me.vkryl.core.ColorUtils;
 import me.vkryl.core.DateUtils;
 import me.vkryl.core.StringUtils;
 import me.vkryl.core.collection.IntList;
+import me.vkryl.core.collection.LongList;
 import me.vkryl.core.collection.LongSet;
 import me.vkryl.core.lambda.CancellableRunnable;
 import me.vkryl.core.lambda.Future;
@@ -1942,7 +1942,19 @@ public class TdlibUi extends Handler {
 
   public void openChat (final TdlibDelegate context, final TdApi.MessageSender senderId, @Nullable ChatOpenParameters openParameters) {
     long chatId = Td.getSenderId(senderId);
-    openChat(context, chatId, openParameters);
+    final TdApi.Function<TdApi.Chat> function;
+    switch (senderId.getConstructor()) {
+      case TdApi.MessageSenderUser.CONSTRUCTOR:
+        function = new TdApi.CreatePrivateChat(((TdApi.MessageSenderUser) senderId).userId, false);
+        break;
+      case TdApi.MessageSenderChat.CONSTRUCTOR:
+        function = new TdApi.GetChat(((TdApi.MessageSenderChat) senderId).chatId);
+        break;
+      default:
+        Td.assertMessageSender_439d4c9c();
+        throw Td.unsupported(senderId);
+    }
+    openChat(context, chatId, function, openParameters);
   }
 
   private void openChat (final TdlibDelegate context, final long chatId, final TdApi.Function<?> createRequest, final @Nullable ChatOpenParameters params) {
@@ -2395,7 +2407,7 @@ public class TdlibUi extends Handler {
     openChat(context, chatId, new ChatOpenParameters().keepStack().highlightMessage(messageId).ensureHighlightAvailable().messageThread(messageThread).urlOpenParameters(openParameters));
   }
 
-  public void openMessage (final TdlibDelegate context, final TdApi.MessageLinkInfo messageLink, final UrlOpenParameters openParameters) {
+  public void openMessage (final TdlibDelegate context, final TdApi.MessageLinkInfo messageLink, final @Nullable UrlOpenParameters openParameters) {
     if (messageLink.message != null) {
       // TODO support for album, media timestamp, etc
       MessageId messageId = new MessageId(messageLink.message.chatId, messageLink.message.id);
@@ -2405,7 +2417,7 @@ public class TdlibUi extends Handler {
           if (error != null) {
             openMessage(context, messageLink.chatId, messageId, openParameters);
           } else {
-            ThreadInfo messageThread = ThreadInfo.openedFromMessage(context.tdlib(), messageThreadInfo, openParameters.messageId);
+            ThreadInfo messageThread = ThreadInfo.openedFromMessage(context.tdlib(), messageThreadInfo, openParameters != null ? openParameters.messageId : null);
             if (Config.SHOW_CHANNEL_POST_REPLY_INFO_IN_COMMENTS) {
               TdApi.Message message = messageThread.getOldestMessage();
               if (message != null && message.replyTo == null && message.forwardInfo != null && tdlib.isChannelAutoForward(message)) {
@@ -3086,7 +3098,7 @@ public class TdlibUi extends Handler {
         if (StringUtils.isEmpty(domain)) {
           return null;
         }
-        int postId = StringUtils.parseInt(uri.getQueryParameter("post"));
+        long postId = StringUtils.parseLong(uri.getQueryParameter("post"));
         if (postId != 0) {
           return tMeUrl + domain + "/" + postId;
         }
@@ -3131,8 +3143,8 @@ public class TdlibUi extends Handler {
         break;
       }
       case "privatepost": {
-        long supergroupId = StringUtils.parseInt(uri.getQueryParameter("channel"));
-        int messageId = StringUtils.parseInt(uri.getQueryParameter("msg_id"));
+        long supergroupId = StringUtils.parseLong(uri.getQueryParameter("channel"));
+        long messageId = StringUtils.parseLong(uri.getQueryParameter("msg_id"));
         if (supergroupId != 0) {
           if (messageId != 0) {
             return tMeUrl + "c/" + supergroupId + "/" + messageId;
@@ -3273,7 +3285,7 @@ public class TdlibUi extends Handler {
     String command = segments.get(0);
     String pathArg = segments.size() > 1 ? segments.get(1) : null;
 
-    int postId = StringUtils.parseInt(pathArg);
+    long postId = StringUtils.parseLong(pathArg);
 
     if (!Strings.isValidLink(command) && postId != 0) {
       return TME_URL_MESSAGE;
@@ -3468,7 +3480,7 @@ public class TdlibUi extends Handler {
       }
       case TdApi.InternalLinkTypeUserPhoneNumber.CONSTRUCTOR: {
         final String phoneNumber = ((TdApi.InternalLinkTypeUserPhoneNumber) linkType).phoneNumber;
-        openChatProfile(context, 0, null, new TdApi.SearchUserByPhoneNumber(phoneNumber), openParameters);
+        openChatProfile(context, 0, null, new TdApi.SearchUserByPhoneNumber(phoneNumber, false), openParameters);
         break;
       }
 
@@ -4657,8 +4669,8 @@ public class TdlibUi extends Handler {
       icons.append(position.isPinned ? R.drawable.deproko_baseline_pin_undo_24 : R.drawable.deproko_baseline_pin_24);
     }
 
-    if (tdlib.canArchiveChat(chatList, chat)) {
-      boolean isArchived = chatList instanceof TdApi.ChatListArchive;
+    if (tdlib.canArchiveOrUnarchiveChat(chat)) {
+      boolean isArchived = tdlib.chatArchived(chat);
       ids.append(isArchived ? R.id.btn_unarchiveChat : R.id.btn_archiveChat);
       strings.append(isArchived ? R.string.UnarchiveChat : R.string.ArchiveChat);
       colors.append(ViewController.OptionColor.NORMAL);
@@ -4759,12 +4771,30 @@ public class TdlibUi extends Handler {
   }
 
   private void showArchiveUnarchiveChat (ViewController<?> context, final TdApi.ChatList chatList, final long chatId, TdApi.MessageSource source, @Nullable Runnable after) {
-    boolean isArchived = tdlib.chatArchived(chatId);
-    context.showOptions(tdlib.chatTitle(chatId), new int[] {isArchived ? R.id.btn_unarchiveChat : R.id.btn_archiveChat, R.id.btn_cancel}, new String[] {Lang.getString(isArchived ? R.string.UnarchiveChat : R.string.ArchiveChat), Lang.getString(R.string.Cancel)}, null, new int[] {isArchived ? R.drawable.baseline_unarchive_24 : R.drawable.baseline_archive_24, R.drawable.baseline_cancel_24}, (itemView, id) -> {
-      if (id == R.id.btn_unarchiveChat || id == R.id.btn_archiveChat) {
-        processChatAction(context, chatList, chatId, null, source, id, after);
+    boolean isUnarchive = tdlib.chatArchived(chatId);
+    String title = tdlib.chatTitleShort(chatId);
+    boolean isUserChat = tdlib.isUserChat(chatId);
+    checkNeedArchiveInFolderHint(chatList, isUnarchive, needHint -> {
+      CharSequence hint;
+      if (needHint) {
+        hint = Lang.getStringBold(isUnarchive ?
+          (isUserChat ? R.string.UnarchiveXInFolder_user : R.string.UnarchiveXInFolder_chat) :
+          (isUserChat ? R.string.ArchiveXInFolder_user : R.string.ArchiveXInFolder_chat),
+          title
+        );
+      } else {
+        hint = Lang.getStringBold(isUnarchive ?
+          (isUserChat ? R.string.UnarchiveX_user : R.string.UnarchiveX_chat) :
+          (isUserChat ? R.string.ArchiveX_user : R.string.ArchiveX_chat),
+          title
+        );
       }
-      return true;
+      context.showOptions(hint, new int[] {isUnarchive ? R.id.btn_unarchiveChat : R.id.btn_archiveChat, R.id.btn_cancel}, new String[] {Lang.getString(isUnarchive ? R.string.UnarchiveChat : R.string.ArchiveChat), Lang.getString(R.string.Cancel)}, null, new int[] {isUnarchive ? R.drawable.baseline_unarchive_24 : R.drawable.baseline_archive_24, R.drawable.baseline_cancel_24}, (itemView, id) -> {
+        if (id == R.id.btn_unarchiveChat || id == R.id.btn_archiveChat) {
+          processChatAction(context, chatList, chatId, null, source, id, after);
+        }
+        return true;
+      });
     });
   }
 
@@ -4941,7 +4971,7 @@ public class TdlibUi extends Handler {
           context.context().navigation().navigateTo(EditChatFolderController.newFolder(context.context(), tdlib, chatFolder));
         } else {
           int chatFolderId = item.getIntValue();
-          tdlib.addChatsToChatFolder(context, chatFolderId, chatIds);
+          addChatsToChatFolder(context, chatFolderId, chatIds);
         }
         if (after != null) {
           after.run();
@@ -4949,11 +4979,119 @@ public class TdlibUi extends Handler {
       }));
   }
 
+  public void showDeleteChatFolderOrLeaveChats (ViewController<?> context, int chatFolderId) {
+    TdApi.ChatFolderInfo info = tdlib.chatFolderInfo(chatFolderId);
+    if (info.isShareable) {
+      tdlib.send(new TdApi.GetChatFolderChatsToLeave(chatFolderId), (result, error) -> post(() -> {
+        if (error != null) {
+          UI.showError(error);
+        } else if (result.totalCount > 0) {
+          ChatFolderInviteLinkController controller = new ChatFolderInviteLinkController(context.context(), tdlib);
+          controller.setArguments(ChatFolderInviteLinkController.Arguments.deleteFolder(info, result.chatIds));
+          controller.show();
+        } else {
+          showDeleteChatFolderConfirm(context, chatFolderId, info.hasMyInviteLinks);
+        }
+      }));
+    } else {
+      showDeleteChatFolderConfirm(context, chatFolderId, info.hasMyInviteLinks);
+    }
+  }
+
+  private void showDeleteChatFolderConfirm (ViewController<?> context, int chatFolderId, boolean hasMyInviteLinks) {
+    tdlib.ui().showDeleteChatFolderConfirm(context, hasMyInviteLinks, () -> {
+      tdlib.deleteChatFolder(chatFolderId, null, null);
+    });
+  }
+
   public void showDeleteChatFolderConfirm (ViewController<?> context, boolean hasMyInviteLinks, Runnable after) {
     // TODO(nikita-toropov) wording
     int infoRes = hasMyInviteLinks ? R.string.DeleteFolderWithInviteLinksConfirm : R.string.RemoveFolderConfirm;
     int actionRes = hasMyInviteLinks ? R.string.Delete : R.string.Remove;
     context.showConfirm(Lang.getMarkdownString(context, infoRes), Lang.getString(actionRes), R.drawable.baseline_delete_24, ViewController.OptionColor.RED, after);
+  }
+
+  public void addChatsToChatFolder (TdlibDelegate delegate, int chatFolderId, long[] chatIds) {
+    if (chatIds.length == 0) {
+      return;
+    }
+    tdlib.send(new TdApi.GetChatFolder(chatFolderId), (chatFolder, error) -> {
+      if (error != null) {
+        UI.showError(chatFolder);
+      } else {
+        addChatsToChatFolderImpl(delegate, chatFolderId, chatFolder, chatIds);
+      }
+    });
+  }
+
+  public void addChatsToChatFolderImpl (TdlibDelegate delegate, int chatFolderId, TdApi.ChatFolder chatFolder, long[] chatIds) {
+    if (chatIds.length == 0) {
+      return;
+    }
+    LongSet pinnedChatIds = new LongSet(chatFolder.pinnedChatIds);
+    LongSet includedChatIds = new LongSet(chatFolder.includedChatIds);
+    for (long chatId : chatIds) {
+      if (pinnedChatIds.has(chatId) || includedChatIds.has(chatId)) {
+        continue;
+      }
+      includedChatIds.add(chatId);
+    }
+    if (includedChatIds.size() == chatFolder.includedChatIds.length) {
+      return;
+    }
+    int chatCount = pinnedChatIds.size() + includedChatIds.size();
+    int secretChatCount = 0;
+    for (long pinnedChatId : pinnedChatIds) {
+      if (ChatId.isSecret(pinnedChatId)) secretChatCount++;
+    }
+    for (long includedChatId : includedChatIds) {
+      if (ChatId.isSecret(includedChatId)) secretChatCount++;
+    }
+    int nonSecretChatCount = chatCount - secretChatCount;
+    long chosenChatCountMax = tdlib.chatFolderChosenChatCountMax();
+    if (secretChatCount > chosenChatCountMax || nonSecretChatCount > chosenChatCountMax) {
+      checkPremiumLimit(new TdApi.PremiumLimitTypeChatFolderChosenChatCount(), (currentLimit, premiumLimit) -> {
+        // FIXME: use tdlib.ui().showPremiumAlert()?
+        CharSequence text;
+        if (currentLimit < premiumLimit) {
+          text = Lang.getMarkdownPlural(delegate, R.string.PremiumLimitChatsInFolder, currentLimit, Lang.boldCreator(), Strings.buildCounter(premiumLimit));
+        } else {
+          text = Lang.getMarkdownPlural(delegate, R.string.LimitChatsInFolder, currentLimit, Lang.boldCreator());
+        }
+        UI.showCustomToast(text, Toast.LENGTH_LONG, 0);
+      });
+      return;
+    }
+    chatFolder.includedChatIds = includedChatIds.toArray();
+    chatFolder.excludedChatIds = ArrayUtils.removeAll(chatFolder.excludedChatIds, chatIds);
+    tdlib.send(new TdApi.EditChatFolder(chatFolderId, chatFolder), (chatFolderInfo, error) -> {
+      if (error != null) {
+        UI.showError(error);
+      }
+    });
+  }
+
+  public void showArchiveHint (TdApi.ChatList chatList, int chatsCount, boolean isUnarchive) {
+    if (chatList.getConstructor() != TdApi.ChatListFolder.CONSTRUCTOR) return;
+    UI.showToast(Lang.pluralBold(isUnarchive ? R.string.UnarchivedXChats : R.string.ArchivedXChats, chatsCount), Toast.LENGTH_SHORT);
+  }
+
+  public void checkNeedArchiveInFolderHint (TdApi.ChatList chatList, boolean isUnarchive, RunnableBool after) {
+    if (chatList.getConstructor() != TdApi.ChatListFolder.CONSTRUCTOR) {
+      after.runWithBool(false);
+      return;
+    }
+    if (isUnarchive) {
+      after.runWithBool(true);
+      return;
+    }
+    tdlib.send(new TdApi.GetChatFolder(((TdApi.ChatListFolder) chatList).chatFolderId), (chatFolder, error) -> {
+      if (chatFolder != null) {
+        post(() -> {
+          after.runWithBool(!chatFolder.excludeArchived);
+        });
+      }
+    });
   }
 
   public boolean processChatAction (ViewController<?> context, final TdApi.ChatList chatList, final long chatId, final @Nullable ThreadInfo messageThread, final TdApi.MessageSource source, final int actionId, @Nullable Runnable after) {
@@ -4975,11 +5113,15 @@ public class TdlibUi extends Handler {
     } else if (actionId == R.id.btn_archiveUnarchiveChat) {
       showArchiveUnarchiveChat(context, chatList, chatId, source, after);
       return true;
-    } else if (actionId == R.id.btn_archiveChat) {
-      tdlib.client().send(new TdApi.AddChatToList(chatId, ChatPosition.CHAT_LIST_ARCHIVE), tdlib.okHandler(after));
-      return true;
-    } else if (actionId == R.id.btn_unarchiveChat) {
-      tdlib.client().send(new TdApi.AddChatToList(chatId, ChatPosition.CHAT_LIST_MAIN), tdlib.okHandler(after));
+    } else if (actionId == R.id.btn_archiveChat || actionId == R.id.btn_unarchiveChat) {
+      boolean isUnarchive = actionId == R.id.btn_unarchiveChat;
+      TdApi.ChatList targetChatList = isUnarchive ? ChatPosition.CHAT_LIST_MAIN : ChatPosition.CHAT_LIST_ARCHIVE;
+      tdlib.send(new TdApi.AddChatToList(chatId, targetChatList), tdlib.typedOkHandler(() -> {
+        showArchiveHint(chatList, 1, isUnarchive);
+        if (after != null) {
+          after.run();
+        }
+      }));
       return true;
     } else if (actionId == R.id.btn_markChatAsRead) {
       if (messageThread != null) {
@@ -5000,11 +5142,60 @@ public class TdlibUi extends Handler {
     } else if (actionId == R.id.btn_removeChatFromFolder) {
       if (TD.isChatListFolder(chatList)) {
         int chatFolderId = ((TdApi.ChatListFolder) chatList).chatFolderId;
-        tdlib.removeChatFromChatFolder(chatFolderId, chatId);
+        removeChatFromChatFolder(chatFolderId, chatId);
       }
       return true;
     }
     return processLeaveButton(context, chatList, chatId, actionId, after);
+  }
+
+  public void removeChatFromChatFolder (int chatFolderId, long chatId) {
+    removeChatsFromChatFolder(chatFolderId, new long[] {chatId});
+  }
+
+  public void removeChatsFromChatFolder (int chatFolderId, long[] chatIds) {
+    if (chatIds.length == 0) {
+      return;
+    }
+    tdlib.send(new TdApi.GetChatFolder(chatFolderId), (chatFolder, error) -> {
+      if (error != null) {
+        UI.showError(error);
+      } else {
+        removeChatsFromChatFolderImpl(chatFolderId, chatFolder, chatIds);
+      }
+    });
+  }
+
+  private void removeChatsFromChatFolderImpl (int chatFolderId, TdApi.ChatFolder chatFolder, long[] chatIds) {
+    if (chatIds.length == 0) {
+      return;
+    }
+    LongList pinnedChatIds = new LongList(chatFolder.pinnedChatIds);
+    LongSet includedChatIds = new LongSet(chatFolder.includedChatIds);
+    LongSet excludedChatIds = new LongSet(chatFolder.excludedChatIds);
+    for (long chatId : chatIds) {
+      boolean removed = pinnedChatIds.remove(chatId) | includedChatIds.remove(chatId);
+      if (removed && Config.CHAT_FOLDERS_SMART_CHAT_DELETION_ENABLED) {
+        TdApi.Chat chat = tdlib.chat(chatId);
+        boolean isBotChat = tdlib.isBotChat(chat);
+        boolean isUserChat = tdlib.isUserChat(chat) && !isBotChat;
+        boolean isContactChat = isUserChat && tdlib.isContactChat(chat);
+        if (!chatFolder.includeContacts && isUserChat && isContactChat) continue;
+        if (!chatFolder.includeNonContacts && isUserChat && !isContactChat) continue;
+        if (!chatFolder.includeGroups && TD.isMultiChat(chat)) continue;
+        if (!chatFolder.includeChannels && tdlib.isChannelChat(chat)) continue;
+        if (!chatFolder.includeBots && isBotChat) continue;
+      }
+      excludedChatIds.add(chatId);
+    }
+    chatFolder.pinnedChatIds = pinnedChatIds.get();
+    chatFolder.includedChatIds = includedChatIds.toArray();
+    chatFolder.excludedChatIds = excludedChatIds.toArray();
+    tdlib.send(new TdApi.EditChatFolder(chatFolderId, chatFolder), (chatFolderInfo, error) -> {
+      if (error != null) {
+        UI.showError(error);
+      }
+    });
   }
 
   public final ForceTouchView.ActionListener createSimpleChatActions (final ViewController<?> context, final TdApi.ChatList chatList, final long chatId, final @Nullable ThreadInfo messageThread, final TdApi.MessageSource source, IntList ids, IntList icons, StringList strings, final boolean allowInteractions, final boolean canSelect, final boolean isSelected, @Nullable Runnable onSelect) {
@@ -5042,10 +5233,11 @@ public class TdlibUi extends Handler {
         strings.append(canRead ? R.string.MarkAsRead : R.string.MarkAsUnread);
         icons.append(canRead ? Config.ICON_MARK_AS_READ : Config.ICON_MARK_AS_UNREAD);
 
-        if (tdlib.canArchiveChat(chatList, chat)) {
+        if (tdlib.canArchiveOrUnarchiveChat(chat)) {
+          boolean isArchived = tdlib.chatArchived(chat);
           ids.append(R.id.btn_archiveUnarchiveChat);
-          strings.append(chatList instanceof TdApi.ChatListArchive ? R.string.Unarchive : R.string.Archive);
-          icons.append(chatList instanceof TdApi.ChatListArchive ? R.drawable.baseline_unarchive_24 : R.drawable.baseline_archive_24);
+          strings.append(isArchived ? R.string.Unarchive : R.string.Archive);
+          icons.append(isArchived ? R.drawable.baseline_unarchive_24 : R.drawable.baseline_archive_24);
         }
 
         ids.append(R.id.btn_removeChatFromListOrClearHistory);
@@ -6460,19 +6652,19 @@ public class TdlibUi extends Handler {
 
     ids.append(R.id.btn_sendScheduled30Min);
     strings.append(Lang.plural(isSelfChat ? R.string.RemindInXMinutes : R.string.SendInXMinutes, 30));
-    icons.append(R.drawable.baseline_schedule_24);
+    icons.append(R.drawable.dotvhs_baseline_time_30m_24);
 
     ids.append(R.id.btn_sendScheduled2Hr);
     strings.append(Lang.plural(isSelfChat ? R.string.RemindInXHours : R.string.SendInXHours, 2));
-    icons.append(R.drawable.baseline_schedule_24);
+    icons.append(R.drawable.dotvhs_baseline_time_2h_24);
 
     ids.append(R.id.btn_sendScheduled8Hr);
     strings.append(Lang.plural(isSelfChat ? R.string.RemindInXHours : R.string.SendInXHours, 8));
-    icons.append(R.drawable.baseline_schedule_24);
+    icons.append(R.drawable.dotvhs_baseline_time_8h_24);
 
     ids.append(R.id.btn_sendScheduled1Yr);
     strings.append(Lang.plural(isSelfChat ? R.string.RemindInXYears : R.string.SendInXYears, 1));
-    icons.append(R.drawable.baseline_schedule_24);
+    icons.append(R.drawable.dotvhs_baseline_time_1y_24);
 
     ids.append(R.id.btn_sendScheduledCustom);
     strings.append(Lang.getString(isSelfChat ? R.string.RemindAtCustomTime : R.string.SendAtCustomTime));
@@ -6669,15 +6861,58 @@ public class TdlibUi extends Handler {
 
   // Telegram Premium
 
+  public interface PremiumLimitCallback {
+    void onPremiumLimitReached (int currentLimit, int premiumLimit);
+  }
+
+  @UiThread
+  public void checkPremiumLimit (TdApi.PremiumLimitType premiumLimitType, @NonNull PremiumLimitCallback callback) {
+    int effectiveLimit;
+    switch (premiumLimitType.getConstructor()) {
+      case TdApi.PremiumLimitTypeChatFolderCount.CONSTRUCTOR:
+        effectiveLimit = tdlib.chatFolderCount();
+        break;
+      case TdApi.PremiumLimitTypeChatFolderInviteLinkCount.CONSTRUCTOR:
+        effectiveLimit = tdlib.chatFolderInviteLinkCountMax();
+        break;
+      case TdApi.PremiumLimitTypeChatFolderChosenChatCount.CONSTRUCTOR:
+        effectiveLimit = tdlib.chatFolderChosenChatCountMax();
+        break;
+      case TdApi.PremiumLimitTypeShareableChatFolderCount.CONSTRUCTOR:
+        effectiveLimit = tdlib.addedShareableChatFolderCountMax();
+        break;
+      default:
+        Td.assertPremiumLimitType_3b3ed738();
+        throw Td.unsupported(premiumLimitType);
+    }
+
+    if (tdlib.hasPremium()) {
+      callback.onPremiumLimitReached(effectiveLimit, effectiveLimit);
+      return;
+    }
+    tdlib.send(new TdApi.GetPremiumLimit(premiumLimitType), (limit, error) -> post(() -> {
+      if (limit != null && limit.defaultValue < limit.premiumValue && effectiveLimit < limit.premiumValue) {
+        callback.onPremiumLimitReached(effectiveLimit, limit.premiumValue);
+      } else {
+        // Note: some users cannot purchase Telegram Premium, for such users GetPremiumLimit returns an error
+        callback.onPremiumLimitReached(effectiveLimit, effectiveLimit);
+      }
+    }));
+  }
+
   @Retention(RetentionPolicy.SOURCE)
   @IntDef({
     PremiumFeature.STICKER,
-    PremiumFeature.RESTRICT_VOICE_AND_VIDEO_MESSAGES
+    PremiumFeature.RESTRICT_VOICE_AND_VIDEO_MESSAGES,
+    PremiumFeature.CUSTOM_EMOJI,
+    PremiumFeature.NEW_CHATS_PRIVACY
   })
   public @interface PremiumFeature {
     int
       STICKER = 1,
-      RESTRICT_VOICE_AND_VIDEO_MESSAGES = 2;
+      RESTRICT_VOICE_AND_VIDEO_MESSAGES = 2,
+      CUSTOM_EMOJI = 3,
+      NEW_CHATS_PRIVACY = 4;
   }
 
   @Retention(RetentionPolicy.SOURCE)
@@ -6708,53 +6943,72 @@ public class TdlibUi extends Handler {
       case PremiumFeature.RESTRICT_VOICE_AND_VIDEO_MESSAGES:
         stringRes = R.string.PremiumRequiredVoiceVideo;
         break;
+      case PremiumFeature.CUSTOM_EMOJI:
+        stringRes = R.string.MessageContainsPremiumFeatures;
+        break;
+      case PremiumFeature.NEW_CHATS_PRIVACY:
+        stringRes = R.string.PremiumRequiredNewChats;
+        break;
       default:
         throw new IllegalStateException();
     }
-    showPremiumRequiredTooltip(context, tooltipManager, view, stringRes);
+    showPremiumRequiredTooltip(context, tooltipManager, view, Lang.getMarkdownString(context, stringRes));
     return true;
   }
 
-  public void showPremiumLimitInfo (ViewController<?> context, View view, @PremiumLimit int premiumLimit) {
-    showPremiumLimitInfo(context, context.context().tooltipManager(), view, premiumLimit);
+  public void showLimitReachedInfo (ViewController<?> context, View view, @PremiumLimit int premiumLimit) {
+    showLimitReachedInfo(context, context.context().tooltipManager(), view, premiumLimit);
   }
 
-  public void showPremiumLimitInfo (ViewController<?> context, TooltipOverlayView tooltipManager, View view, @PremiumLimit int premiumLimit) {
-    if (tdlib.hasPremium())
-      return;
+  public void showLimitReachedInfo (ViewController<?> context, TooltipOverlayView tooltipManager, View view, @PremiumLimit int premiumLimit) {
+    TdApi.PremiumLimitType type;
+    int premiumPluralRes, defaultPluralRes;
     switch (premiumLimit) {
-      case PremiumLimit.SHAREABLE_FOLDER_COUNT:
-        showPremiumLimitTooltip(context, tooltipManager, view, R.string.PremiumRequiredAddShareableFolder, new TdApi.PremiumLimitTypeShareableChatFolderCount());
+      case PremiumLimit.SHAREABLE_FOLDER_COUNT: {
+        type = new TdApi.PremiumLimitTypeShareableChatFolderCount();
+        premiumPluralRes = R.string.PremiumLimitAddShareableFolder;
+        defaultPluralRes = R.string.LimitAddShareableFolder;
         break;
-      case PremiumLimit.CHAT_FOLDER_COUNT:
-        showPremiumLimitTooltip(context, tooltipManager, view, R.string.PremiumRequiredCreateFolder, new TdApi.PremiumLimitTypeChatFolderCount());
-        break;
-      case PremiumLimit.CHAT_FOLDER_INVITE_LINK_COUNT:
-        showPremiumRequiredTooltip(context, tooltipManager, view, R.string.PremiumRequiredCreateChatFolderInviteLink);
-        break;
-      default:
-        throw new IllegalStateException();
-    }
-  }
-
-  private void showPremiumLimitTooltip (ViewController<?> context, TooltipOverlayView tooltipManager, View view, @StringRes int markdownStringRes, TdApi.PremiumLimitType premiumLimitType) {
-    WeakReference<View> viewRef = new WeakReference<>(view);
-    Object viewTag = view.getTag();
-    tdlib.send(new TdApi.GetPremiumLimit(premiumLimitType), (result, error) -> context.runOnUiThreadOptional(() -> {
-      View targetView = viewRef.get();
-      if (targetView != null && ViewCompat.isAttachedToWindow(targetView) && viewTag == targetView.getTag() && result.defaultValue < result.premiumValue) {
-        showPremiumRequiredTooltip(context, tooltipManager, targetView, markdownStringRes, result.defaultValue, result.premiumValue);
       }
-    }));
+      case PremiumLimit.CHAT_FOLDER_COUNT: {
+        type = new TdApi.PremiumLimitTypeChatFolderCount();
+        premiumPluralRes = R.string.PremiumLimitCreateFolder;
+        defaultPluralRes = R.string.LimitCreateFolder;
+        break;
+      }
+      case PremiumLimit.CHAT_FOLDER_INVITE_LINK_COUNT: {
+        type = new TdApi.PremiumLimitTypeChatFolderInviteLinkCount();
+        premiumPluralRes = R.string.PremiumLimitChatFolderInviteLink;
+        defaultPluralRes = R.string.LimitChatFolderInviteLink;
+        break;
+      }
+      default: {
+        throw new IllegalArgumentException(Integer.toString(premiumLimit));
+      }
+    }
+    showPremiumLimitTooltip(context, tooltipManager, view, premiumPluralRes, type, defaultPluralRes);
   }
 
-  private void showPremiumRequiredTooltip (ViewController<?> context, TooltipOverlayView tooltipManager, View view, @StringRes int markdownStringRes, Object... formatArgs) {
-      // TODO proper alert with sections
-      tooltipManager
+  private void showPremiumLimitTooltip (ViewController<?> context, TooltipOverlayView tooltipManager, View view, @StringRes int markdownStringRes, TdApi.PremiumLimitType premiumLimitType, @StringRes int defaultMarkdownStringRes) {
+    checkPremiumLimit(premiumLimitType, (currentLimit, premiumLimit) -> {
+      if (currentLimit < premiumLimit) {
+        showLimitReachedTooltip(context, tooltipManager, view, markdownStringRes, currentLimit, Strings.buildCounter(premiumLimit));
+      } else {
+        showLimitReachedTooltip(context, tooltipManager, view, defaultMarkdownStringRes, currentLimit);
+      }
+    });
+  }
+
+  private void showLimitReachedTooltip (ViewController<?> context, TooltipOverlayView tooltipManager, View view, @StringRes int pluralRes, long num, Object... formatArgs) {
+    showPremiumRequiredTooltip(context, tooltipManager, view, Lang.getMarkdownPlural(context, pluralRes, num, Lang.boldCreator(), formatArgs));
+  }
+
+  private void showPremiumRequiredTooltip (ViewController<?> context, TooltipOverlayView tooltipManager, View view, CharSequence text) {
+    tooltipManager
       .builder(view)
       .icon(R.drawable.baseline_warning_24)
       .controller(context)
-      .show(tdlib, Lang.getMarkdownString(context, markdownStringRes, formatArgs))
+      .show(tdlib, text)
       .hideDelayed();
   }
 
@@ -7227,7 +7481,7 @@ public class TdlibUi extends Handler {
       context.showOptions(b.build(), (optionItemView, id) -> {
         if (id == R.id.btn_privacySettings) {
           SettingsPrivacyKeyController c = new SettingsPrivacyKeyController(context.context(), context.tdlib());
-          c.setArguments(new TdApi.UserPrivacySettingShowBirthdate());
+          c.setArguments(new SettingsPrivacyKeyController.Args(new TdApi.UserPrivacySettingShowBirthdate()));
           context.navigateTo(c);
         } else if (id == R.id.btn_birthdate) {
           showBirthdatePicker(context, currentBirthdate);
